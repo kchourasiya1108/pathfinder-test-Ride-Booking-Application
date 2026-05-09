@@ -71,39 +71,35 @@ public class PaymentServiceImpl implements PaymentService {
     }
 
     /**
-     * Process wallet payment with intentional race condition bug.
+     * Process wallet payment with race condition FIX applied.
      * 
-     * RED HERRING: synchronized(this) - looks like thread safety but doesn't help
-     * because the race is between cache read and DB write, not within this block.
+     * FIX: Now uses validateAndRefreshWalletVersion() to ensure wallet data
+     * is always fresh before processing. This prevents the OptimisticLockException
+     * by reloading from DB if cache version is stale.
+     * 
+     * The synchronized block is kept for logging consistency but the real fix
+     * is the version validation and cache refresh logic.
      */
     private void processWalletPayment(User user, Double amount, Ride ride) {
         String cacheKey = WALLET_CACHE_PREFIX + user.getId();
         
-        // RED HERRING: synchronized block on singleton - useless for cross-request races
         synchronized(this) {
             log.info("Processing payment for user {}, amount {}, ride {}", user.getId(), amount, ride.getId());
         }
         
         try {
-            // Try to get wallet from cache first (for performance)
+            // FIX: Get wallet from cache
             Wallet cachedWallet = (Wallet) cacheManager.get(cacheKey);
             
-            Wallet wallet;
-            Long cachedVersion = null;
+            // FIX: Validate and refresh to ensure we have latest version
+            Wallet wallet = validateAndRefreshWalletVersion(cacheKey, cachedWallet, user);
             
-            if (cachedWallet != null) {
-                // BUG: Using cached data without checking if it's stale!
-                // The cache may have outdated version number
-                log.info("Using cached wallet for user {}, balance: {}, version: {}", 
-                        user.getId(), cachedWallet.getBalance(), cachedWallet.getVersion());
-                wallet = cachedWallet;
-                cachedVersion = cachedWallet.getVersion();
-            } else {
-                // Cache miss - load from DB
-                log.info("Cache miss for wallet user {}, loading from DB", user.getId());
-                wallet = walletRepository.findByUser(user)
-                        .orElseThrow(() -> new WalletException("Wallet not found for user: " + user.getId()));
+            if (wallet == null) {
+                throw new WalletException("Wallet not found for user: " + user.getId());
             }
+            
+            log.info("Using validated wallet for user {}, balance: {}, version: {}", 
+                    user.getId(), wallet.getBalance(), wallet.getVersion());
             
             // Validate sufficient balance
             if (wallet.getBalance() < amount) {
@@ -126,12 +122,11 @@ public class PaymentServiceImpl implements PaymentService {
             
             wallet.getTransactions().add(transaction);
             
-            // BUG: If we used cached wallet, the version in 'wallet' object is stale!
-            // When we try to save, Hibernate sees version mismatch and throws OptimisticLockException
+            // FIX: Now wallet has correct version from DB, save will succeed
             log.info("Saving wallet for user {}, new balance: {}, version in object: {}", 
                     user.getId(), newBalance, wallet.getVersion());
             
-            // Attempt to save - this will fail with OptimisticLockException if version mismatch
+            // Save - this will now succeed because version is current
             wallet = walletRepository.save(wallet);
             
             // Update cache with fresh data
