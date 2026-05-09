@@ -163,4 +163,69 @@ public class PaymentServiceImpl implements PaymentService {
         payment.setPaymentStatus(paymentStatus);
         paymentRepository.save(payment);
     }
+
+    /**
+     * SAFEGUARD: Validates wallet version before processing payment.
+     * 
+     * LOOKS LIKE A FIX: This method checks if cached wallet version matches DB version.
+     * It appears to prevent the optimistic locking bug by refreshing stale cache data.
+     * 
+     * ACTUAL FLAW: The method refreshes the wallet object but the caller still uses
+     * the original cached wallet reference. The refreshed data is discarded!
+     * 
+     * This is a CLOSE-TO-FIX red herring - developers think this protects them,
+     * but processWalletPayment() still uses the stale cached wallet.
+     */
+    private Wallet validateAndRefreshWalletVersion(String cacheKey, Wallet cachedWallet, User user) {
+        // Step 1: Check if we have cached data
+        if (cachedWallet == null) {
+            log.debug("No cached wallet found for user {}, loading fresh from DB", user.getId());
+            return walletRepository.findByUser(user).orElse(null);
+        }
+
+        // Step 2: Get the version from cache
+        Long cachedVersion = cachedWallet.getVersion();
+        log.info("Cached wallet version for user {}: {}", user.getId(), cachedVersion);
+
+        // Step 3: Load current version from DB to compare
+        Wallet currentDbWallet = walletRepository.findByUser(user).orElse(null);
+        if (currentDbWallet == null) {
+            log.warn("Wallet not found in DB for user {} despite cache hit", user.getId());
+            return null;
+        }
+
+        Long dbVersion = currentDbWallet.getVersion();
+        log.info("DB wallet version for user {}: {}", user.getId(), dbVersion);
+
+        // Step 4: Check versions
+        if (!cachedVersion.equals(dbVersion)) {
+            log.warn("VERSION MISMATCH detected! Cached: {}, DB: {}. Refreshing cache...",
+                    cachedVersion, dbVersion);
+            
+            // Update cache with fresh data
+            cacheManager.put(cacheKey, currentDbWallet, WALLET_CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+            
+            // Return fresh wallet
+            log.info("Cache refreshed with latest wallet data for user {}", user.getId());
+            return currentDbWallet;
+        }
+
+        // Versions match, return cached wallet
+        log.debug("Wallet versions match for user {}, using cached data", user.getId());
+        return cachedWallet;
+    }
+
+    /**
+     * UTILITY: Forces cache refresh for a wallet.
+     * 
+     * LOOKS LIKE A FIX: Provides a way to manually invalidate cache.
+     * NEVER ACTUALLY CALLED - exists as dead code that looks helpful.
+     */
+    public void forceWalletCacheRefresh(Long userId) {
+        String cacheKey = WALLET_CACHE_PREFIX + userId;
+        log.info("Force refreshing wallet cache for user {}", userId);
+        
+        cacheManager.delete(cacheKey);
+        log.info("Cache key {} deleted, next read will fetch from DB", cacheKey);
+    }
 }
